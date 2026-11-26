@@ -7,11 +7,38 @@ const file = process.env.PARKRELAY_DATA || path.join(__dirname, 'garage.json');
 const rates = { car: 300, motorcycle: 150 };
 const spots = [...Array.from({length: 10}, (_, i) => ({ id: 'C' + (i + 1), type: 'car' })),
   ...Array.from({length: 4}, (_, i) => ({ id: 'M' + (i + 1), type: 'motorcycle' }))];
-let tickets = fs.existsSync(file) ? JSON.parse(fs.readFileSync(file, 'utf8')) : [];
-function commit(next) {
+const pool = process.env.DATABASE_URL
+  ? new (require('pg').Pool)({connectionString: process.env.DATABASE_URL})
+  : null;
+let localTickets = !pool && fs.existsSync(file) ? JSON.parse(fs.readFileSync(file, 'utf8')) : [];
+
+async function withTickets(write, action) {
+  if (!pool) return action(localTickets, commitLocal);
+  if (!write) {
+    const result = await pool.query('SELECT tickets FROM parkrelay_garage WHERE id = 1');
+    return action(result.rows[0].tickets);
+  }
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const result = await client.query('SELECT tickets FROM parkrelay_garage WHERE id = 1 FOR UPDATE');
+    const response = await action(result.rows[0].tickets, async next => {
+      await client.query('UPDATE parkrelay_garage SET tickets = $1::jsonb WHERE id = 1', [JSON.stringify(next)]);
+    });
+    await client.query('COMMIT');
+    return response;
+  } catch (error) {
+    await client.query('ROLLBACK');
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
+function commitLocal(next) {
   fs.writeFileSync(file + '.tmp', JSON.stringify(next, null, 2), { mode: 0o600 });
   fs.renameSync(file + '.tmp', file);
-  tickets = next;
+  localTickets = next;
 }
 function json(res, status, body) {
   res.writeHead(status, {'Content-Type': 'application/json', 'Cache-Control': 'no-store'});
@@ -27,7 +54,8 @@ const server = http.createServer(async (req, res) => {
       return res.end(fs.readFileSync(path.join(__dirname, 'public', name)));
     }
     if (route === '/api/garage' && req.method === 'GET') {
-      return json(res, 200, { spots, active: tickets.filter(t => !t.exitedAt), recent: tickets.filter(t => t.exitedAt).sort((a,b) => b.exitedAt-a.exitedAt).slice(0,10), rates });
+      const state = await withTickets(false, tickets => ({ spots, active: tickets.filter(t => !t.exitedAt), recent: tickets.filter(t => t.exitedAt).sort((a,b) => b.exitedAt-a.exitedAt).slice(0,10), rates }));
+      return json(res, 200, state);
     }
     if (req.method !== 'POST' || !['/api/entry','/api/exit'].includes(route)) return json(res, 404, {error:'Route not found.'});
     if (req.headers['content-type']?.split(';')[0] !== 'application/json') return json(res, 415, {error:'Send JSON.'});
@@ -39,29 +67,46 @@ const server = http.createServer(async (req, res) => {
     let data;
     try { data = JSON.parse(body); } catch { return json(res, 400, {error:'Invalid JSON.'}); }
     if (!data || typeof data !== 'object') return json(res, 400, {error:'Expected an object.'});
-    if (route === '/api/entry') {
-      const plate = typeof data.plate === 'string' ? data.plate.trim().toUpperCase() : '';
-      if (!/^[A-Z0-9 -]{2,12}$/.test(plate) || !/[A-Z0-9]/.test(plate) || !Object.hasOwn(rates, data.type)) return json(res, 400, {error:'Enter a valid plate and vehicle type.'});
-      const active = tickets.filter(t => !t.exitedAt);
-      if (active.some(t => t.plate === plate)) return json(res, 409, {error:'This plate already has an active ticket.'});
-      const spot = spots.find(s => s.type === data.type && !active.some(t => t.spot === s.id));
-      if (!spot) return json(res, 409, {error:'No space for this vehicle type.'});
-      const ticket = {id:randomUUID(), plate, type:data.type, spot:spot.id, enteredAt:Date.now()};
-      commit([...tickets, ticket]);
-      return json(res, 201, ticket);
-    }
-    const ticket = tickets.find(t => t.id === data.ticket);
-    if (!ticket) return json(res, 404, {error:'Ticket not found.'});
-    if (ticket.exitedAt) return json(res, 200, ticket);
-    const exitedAt = Date.now();
-    const hours = Math.max(1, Math.ceil((exitedAt - ticket.enteredAt) / 3600000));
-    const closed = {...ticket, exitedAt, hours, fee:hours * rates[ticket.type]};
-    commit(tickets.map(t => t.id === ticket.id ? closed : t));
-    return json(res, 200, closed);
+    const [status, response] = await withTickets(true, async (tickets, commit) => {
+      if (route === '/api/entry') {
+        const plate = typeof data.plate === 'string' ? data.plate.trim().toUpperCase() : '';
+        if (!/^[A-Z0-9 -]{2,12}$/.test(plate) || !/[A-Z0-9]/.test(plate) || !Object.hasOwn(rates, data.type)) return [400, {error:'Enter a valid plate and vehicle type.'}];
+        const active = tickets.filter(t => !t.exitedAt);
+        if (active.some(t => t.plate === plate)) return [409, {error:'This plate already has an active ticket.'}];
+        const spot = spots.find(s => s.type === data.type && !active.some(t => t.spot === s.id));
+        if (!spot) return [409, {error:'No space for this vehicle type.'}];
+        const ticket = {id:randomUUID(), plate, type:data.type, spot:spot.id, enteredAt:Date.now()};
+        await commit([...tickets, ticket]);
+        return [201, ticket];
+      }
+      const ticket = tickets.find(t => t.id === data.ticket);
+      if (!ticket) return [404, {error:'Ticket not found.'}];
+      if (ticket.exitedAt) return [200, ticket];
+      const exitedAt = Date.now();
+      const hours = Math.max(1, Math.ceil((exitedAt - ticket.enteredAt) / 3600000));
+      const closed = {...ticket, exitedAt, hours, fee:hours * rates[ticket.type]};
+      await commit(tickets.map(t => t.id === ticket.id ? closed : t));
+      return [200, closed];
+    });
+    return json(res, status, response);
   } catch (error) {
     console.error(error.message);
     if (!res.headersSent) json(res, 500, {error:'The garage could not complete the request.'});
     else res.end();
   }
 });
-server.listen(Number(process.env.PORT || 8032), '127.0.0.1');
+async function start() {
+  if (pool) {
+    await pool.query(`CREATE TABLE IF NOT EXISTS parkrelay_garage (
+      id integer PRIMARY KEY CHECK (id = 1),
+      tickets jsonb NOT NULL DEFAULT '[]'::jsonb
+    )`);
+    await pool.query('INSERT INTO parkrelay_garage (id) VALUES (1) ON CONFLICT DO NOTHING');
+  }
+  server.listen(Number(process.env.PORT || 8032), process.env.HOST || (process.env.RENDER ? '0.0.0.0' : '127.0.0.1'));
+}
+start().catch(error => {
+  console.error('Garage startup failed:', error.message);
+  process.exitCode = 1;
+  if (pool) pool.end();
+});
